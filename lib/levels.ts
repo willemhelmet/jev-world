@@ -46,6 +46,7 @@ export const BUILTIN_LEVELS: Level[] = [
     rubric: {
       events: [
         { id: "ring_pass", label: "RING", points: 1, repeat: true, cooldownS: 4,
+          evidence: { target: "ring", minSize: 0.35 },
           question:
             "Did the jet ski just pass THROUGH a glowing orange ring? In the FIRST image a ring is close ahead of the jet ski; in the LAST image the jet ski is inside the ring or the ring has slipped past/behind it at the frame edges. A ring that is still ahead in both images, or one the jet ski went around, does not count." },
       ],

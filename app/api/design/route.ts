@@ -21,7 +21,7 @@ const LEVEL_TYPE = `type Level = { id: string; title: string; brief: string; goa
   targets: { id: string; label: string; describe: string }[];
   plan: { start: string; nodes: { id: string; label: string; when: string; mode: "search"|"steer"|"act"|"interact";
     target?: string; actions?: string[]; interaction?: { label: string; event: string; after: string }; next: string[] }[] };
-  rubric: { events: { id: string; label: string; question: string; points: number; repeat: boolean; cooldownS?: number }[];
+  rubric: { events: { id: string; label: string; question: string; points: number; repeat: boolean; cooldownS?: number; evidence?: { target: string; minSize: number } }[];
     winPoints?: number; winEvent?: string; timeLimitS: number } };`;
 
 const LEVEL_SYSTEM = `You design short game levels played inside LingBot World 2 (a real-time image-to-video world model) by an AI player called Jev, scored by an independent AI referee.

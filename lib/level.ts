@@ -76,6 +76,14 @@ export type ScoreEvent = {
   repeat: boolean;
   /** Minimum seconds between repeats. */
   cooldownS?: number;
+  /**
+   * Evidence gate: only award the point if, within the last ~2.5s, the
+   * player's own bounding box showed `target` this big (box height as a
+   * fraction of the frame) and roughly centred — i.e. it was really being
+   * approached. Guards against the world drifting and a far-away object
+   * simply vanishing between the referee's two frames.
+   */
+  evidence?: { target: string; minSize: number };
 };
 
 export type Rubric = {
@@ -168,7 +176,8 @@ export function validateLevel(raw: unknown): Level {
     }))
     .filter((t) => t.label && t.describe);
   if (!targets.length) throw new Error("Level needs at least one target");
-  const plan = validatePlan(l.plan, new Set(targets.map((t) => t.id)));
+  const targetIds = new Set(targets.map((t) => t.id));
+  const plan = validatePlan(l.plan, targetIds);
   const events = (Array.isArray(l.rubric?.events) ? l.rubric.events : [])
     .slice(0, 6)
     .map((e, i) => ({
@@ -178,6 +187,10 @@ export function validateLevel(raw: unknown): Level {
       points: Number.isFinite(e?.points) ? Math.max(0, Math.min(100, Number(e.points))) : 1,
       repeat: !!e?.repeat,
       cooldownS: Number.isFinite(e?.cooldownS) ? Math.max(1, Math.min(30, Number(e.cooldownS))) : 4,
+      evidence:
+        e?.evidence && targetIds.has(String(e.evidence.target)) && Number.isFinite(e.evidence.minSize)
+          ? { target: String(e.evidence.target), minSize: Math.max(0.05, Math.min(0.95, Number(e.evidence.minSize))) }
+          : undefined,
     }))
     .filter((e) => e.question);
   if (!events.length) throw new Error("Rubric needs at least one scoring event");

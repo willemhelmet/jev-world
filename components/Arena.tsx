@@ -27,6 +27,8 @@ const EVENT_MS = 5000; //          interaction "event" clause duration
 const STUCK_MS = 15000; //         replan after this long in one state without scoring
 const REPLAN_COOLDOWN_MS = 25000;
 const STALE_MS = 4000; //          release controls if a decision takes longer
+const EVIDENCE_MS = 2500; //       referee points need player box evidence from this window
+const EVIDENCE_CENTER = 0.3; //    …with the target's centre within ±this of frame centre
 
 type Controls = { long: "idle" | "forward" | "back"; lat: "idle" | "strafe_left" | "strafe_right"; look: "idle" | "left" | "right" };
 const IDLE: Controls = { long: "idle", lat: "idle", look: "idle" };
@@ -108,6 +110,8 @@ export function Arena({ level, onStatus }: { level: Level; onStatus?: (s: ArenaS
     lastReplanAt: 0,
     lastSeenSide: {} as Record<string, "left" | "right">,
     history: [] as { action: string; state: string }[],
+    boxLog: [] as { t: number; boxes: PlayerDecision["boxes"] }[], // evidence for the referee gate
+    rejectedAt: new Map<string, number>(),
     hud: null as unknown as HudState,
   });
   g.current.hud ??= freshHud();
@@ -222,6 +226,7 @@ export function Arena({ level, onStatus }: { level: Level; onStatus?: (s: ArenaS
     Object.assign(s, {
       frames: [], controls: IDLE, moving: false, lastPrompt: "", afters: [], pendingEvent: null,
       fired: new Set(), scored: new Map(), nodeSince: 0, lastScoreAt: 0, lastReplanAt: 0, lastSeenSide: {}, history: [],
+      boxLog: [], rejectedAt: new Map(),
     });
     s.hud = { ...freshHud(), recording: !!recorderRef.current };
     resetOverlay();
@@ -362,6 +367,7 @@ export function Arena({ level, onStatus }: { level: Level; onStatus?: (s: ArenaS
       if (!s.running || epoch !== s.epoch) return;
       const d = data as PlayerDecision;
       h.decision = d;
+      s.boxLog = [...s.boxLog.filter((b) => performance.now() - b.t < 4000), { t: performance.now(), boxes: d.boxes }];
       h.ticks++;
       setTicks(h.ticks);
       const now = performance.now();
@@ -449,6 +455,22 @@ export function Arena({ level, onStatus }: { level: Level; onStatus?: (s: ArenaS
           for (const e of level.rubric.events) {
             const p = data.events?.[e.id];
             if (p == null || p < SCORE_P || !open.includes(e.id)) continue;
+            // Evidence gate: did the player actually have this target big and centred just now?
+            if (e.evidence) {
+              const ev = e.evidence;
+              const ok = s.boxLog.some(({ t, boxes }) => {
+                const b = boxes[ev.target];
+                if (now - t > EVIDENCE_MS || !b || (b.seen ?? 0) < SEEN) return false;
+                const size = b.box.bottom - b.box.top;
+                const cx = (b.box.left + b.box.right) / 2;
+                return size >= ev.minSize && Math.abs(cx - 0.5) <= EVIDENCE_CENTER;
+              });
+              if (!ok) {
+                if (now - (s.rejectedAt.get(e.id) ?? 0) > 2000) log(`✗ ${e.label} vetoed (${Math.round(p * 100)}%): no close ${ev.target} seen`);
+                s.rejectedAt.set(e.id, now);
+                continue;
+              }
+            }
             s.scored.set(e.id, now);
             s.lastScoreAt = now;
             h.score += e.points;
@@ -519,27 +541,50 @@ export function Arena({ level, onStatus }: { level: Level; onStatus?: (s: ArenaS
   }, [applyControls]);
 
   const toggleRecord = () => {
-    if (recorderRef.current) { recorderRef.current.stop(); return; }
-    const c = canvasRef.current;
-    if (!c) return;
-    const type = ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t));
-    const rec = new MediaRecorder(c.captureStream(30), { mimeType: type, videoBitsPerSecond: 12_000_000 });
-    const chunks: Blob[] = [];
-    rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
-    rec.onstop = () => {
-      const blob = new Blob(chunks, { type: rec.mimeType });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `jev-world-${level.id}-${Date.now()}.${rec.mimeType.includes("mp4") ? "mp4" : "webm"}`;
-      a.click();
+    const finish = () => {
       recorderRef.current = null;
       g.current.hud.recording = false;
       setRecording(false);
+    };
+    const live = recorderRef.current;
+    if (live) {
+      if (live.state === "inactive") finish();
+      else {
+        live.stop();
+        setTimeout(() => recorderRef.current === live && finish(), 4000); // never leave the UI stuck
+      }
+      return;
+    }
+    const c = canvasRef.current;
+    if (!c) return;
+    const type = ["video/mp4;codecs=avc1", "video/webm;codecs=vp9", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t));
+    const rec = new MediaRecorder(c.captureStream(30), { mimeType: type, videoBitsPerSecond: 10_000_000 });
+    const name = `jev-world-${level.id}-${Date.now()}.${rec.mimeType.includes("mp4") ? "mp4" : "webm"}`;
+    const chunks: Blob[] = [];
+    // Stream each chunk to recordings/ as it arrives (in order), so the file
+    // exists on disk even if the recorder never fires "stop".
+    let upload = Promise.resolve();
+    rec.ondataavailable = (e) => {
+      if (!e.data.size) return;
+      chunks.push(e.data);
+      const part = e.data;
+      upload = upload.then(() =>
+        fetch(`/api/recordings?name=${name}&append=1`, { method: "POST", body: part }).then(() => undefined, () => undefined),
+      );
+    };
+    rec.onstop = () => {
+      void upload.then(() => log(`saved recordings/${name}`));
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob(chunks, { type: rec.mimeType }));
+      a.download = name;
+      a.click();
+      finish();
     };
     rec.start(1000);
     recorderRef.current = rec;
     g.current.hud.recording = true;
     setRecording(true);
+    log(`recording → recordings/${name}`);
   };
 
   const ready = lw2.status === "ready";

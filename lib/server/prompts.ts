@@ -21,6 +21,7 @@ export const PLAN_RULES = `Plan rules:
 
 export const RUBRIC_RULES = `Rubric rules:
 - Events are strict yes/no questions for the referee. Repeating objectives (rings, coins) compare the FIRST and LAST image ("in the FIRST image X was close ahead; in the LAST image the player has passed through it"). One-off outcomes ask about the LAST image ("In the LAST image, is the door visibly open…"). Always say what does NOT count.
+- For events about reaching/passing a target, add "evidence": {"target": "<target id>", "minSize": 0.3-0.4}. The point then only counts if the player's bounding box showed that target big and centred just before (the world drifts, and distant objects can vanish between frames).
 - Set winPoints (e.g. 5 rings) or winEvent (the final outcome), and timeLimitS (60-180).`;
 
 export const EXAMPLE_LEVEL = JSON.stringify({
