@@ -2,47 +2,36 @@
 
 **A decision model plays games inside a world model.**
 
-[LingBot World 2](https://www.reactor.inc) generates an interactive video world from one image and a prompt, in real time. [Jev](https://openrouter.ai/docs/guides/community/jev) — TypeSafe's decision model — watches that video and plays it. A second agent (Claude) designs the levels.
+[LingBot World 2](https://www.reactor.inc) generates an interactive video world from one image and a prompt, in real time. [Jev](https://openrouter.ai/docs/guides/community/jev) — TypeSafe's decision model — watches that video and plays it. Kimi K3 designs the levels and plans, and a second Jev referees.
 
-There's no game engine underneath. The key, the door and the buoy exist only because the prompt says so. "Picking up the key" means weaving a sentence into the prompt, and whether it worked is up to Jev looking at the next frames. This repo is a harness for finding out how far that goes.
+There's no game engine underneath. The rings, the key and the door exist only because the image and prompt put them there. Whether anything actually happened is up to an AI referee watching the frames.
 
+## Four agents
+
+```mermaid
+flowchart LR
+  D["Designer (Kimi K3)<br/>image edit + prompt + goal<br/>plan graph + rubric"] --> W[LingBot World 2]
+  D --> P["Planner (Kimi K3)<br/>owns the plan graph,<br/>replans when stuck"]
+  P --> J["Player (Jev)<br/>which state am I in?<br/>steer / search / act / interact"]
+  J -- controls + prompt clauses --> W
+  W -- frames --> J
+  W -- frames 1s apart --> R["Referee (Jev)<br/>independent scoring<br/>from frames + rubric only"]
+  R -- points / win --> HUD
 ```
- ┌──────────────┐  level JSON   ┌───────────────────────────────────────────┐
- │  Designer    │──────────────▶│  Arena (browser)                           │
- │  (Claude)    │  world prompt │                                           │
- │  image+theme │  targets      │   LingBot World 2 ──video──▶ canvas ◀── HUD │
- └──────────────┘  stages       │        ▲                       │           │
-                                │        │ move / turn /         │ 2 frames  │
-                                │        │ prompt clauses        ▼           │
-                                │   player loop ◀──decision── Jev (/decisions)│
-                                └───────────────────────────────────────────┘
-```
 
-## How it works
+| agent | model | sees | does |
+| ----- | ----- | ---- | ---- |
+| **Designer** (`app/api/design`) | Kimi K3 + nano-banana-pro (Replicate) | a theme (new world) or an image + idea | **New world:** writes a scene, renders the opening frame from scratch, then designs the level by looking at that frame. **From image:** designs the level and edits its objects into the image. Output: goal, world prompt, targets, **plan graph**, **rubric**. LingBot needs an opening image, so this step is required for any new world. |
+| **Planner** (`app/api/plan`) | Kimi K3 (low effort) | current frame, plan, recent history | rewrites the plan graph when the player has been stuck in one state for 15s (or on 🧠 Replan) |
+| **Player** (`app/api/jev`) | Jev | last two frames, plan | every tick: classifies the current **plan state** (`choice`), boxes every target (`box` + `noul` visibility), picks an action (`choice`). The state's mode decides control: **steer** = drive at the target's bounding box, **search** = turn toward where it was last seen, **act** = Jev's best allowed action, **interact** = fire a prompt event. |
+| **Referee** (`app/api/referee`) | Jev, separate calls | two frames ~1s apart + rubric questions only | scores events ("passed through a ring"), with cooldowns, and decides the win. It never sees the plan or the player's reasoning, so the player can't grade its own homework. |
 
-**Levels** (`lib/level.ts`) are the contract between the agents:
-
-- `prompt.base / moving / still`: the world LingBot should generate
-- `targets`: things to track. Jev draws a bounding box around each one every tick.
-- `stages`: ordered objectives. Each has a strict visual `done` check. An interaction stage also has a `ready` check and an `interaction` with an `event` clause (played for ~5s) and an `after` clause (the new, persistent world state).
-
-**Each tick** the app sends Jev the last two frames and one [Decisions](https://openrouter.ai/docs/guides/community/multimodal-decisions) request (`app/api/jev/route.ts`):
-
-| question       | type     | used for                                           |
-| -------------- | -------- | -------------------------------------------------- |
-| `action`       | `choice` | control to hold until the next tick (W/S/A/D/←/→/interact/wait) |
-| `box:<target>` | `box`    | bounding box overlay                               |
-| `seen:<target>`| `noul`   | hide boxes for targets that aren't visible (`box` always returns one) |
-| `ready`        | `noul`   | gate interactions: refused unless ≥ 0.55            |
-| `done`         | `noul`   | stage completes after 2 consecutive ticks ≥ 0.7    |
-| `blocked`      | `noul`   | HUD / debugging                                    |
-
-**The overlay** (`lib/overlay.ts`) draws the live frame, Jev's boxes, the action probabilities and the objective checklist onto one canvas. **● Record** captures that canvas to MP4/WebM, so the demo video is a recording of exactly what you see.
+Everything is drawn onto one canvas: the live frame, the boxes, a steering line, the goal, score and timer, the plan with the current state lit up, and the player's and referee's probabilities. **● Record** captures that canvas, so the demo video is exactly what you see. The sidebar shows the plan as a live mermaid graph.
 
 ## Quick start
 
 ```bash
-cp .env.example .env.local   # add REACTOR_API_KEY and OPENROUTER_API_KEY
+cp .env.example .env.local   # add your keys (see table below)
 pnpm install
 pnpm dev
 ```
@@ -54,9 +43,13 @@ To make a new level, choose a starting image (or upload your own), optionally ty
 | env var              | default                     |                                     |
 | -------------------- | --------------------------- | ----------------------------------- |
 | `REACTOR_API_KEY`    | —                           | LingBot World 2 sessions            |
-| `OPENROUTER_API_KEY` | —                           | both agents                         |
-| `JEV_MODEL`          | `typesafe/jev-1.14`         | 1.14+ is required for `box`         |
-| `DESIGNER_MODEL`     | `anthropic/claude-opus-5.5` | any OpenRouter vision chat model    |
+| `TYPESAFE_API_KEY`   | —                           | Jev, direct from TypeSafe (preferred) |
+| `DESIGNER_BASE_URL` / `DESIGNER_API_KEY` | — | any OpenAI-compatible endpoint for the designer |
+| `OPENROUTER_API_KEY` | —                           | fallback that can run both agents   |
+| `JEV_MODEL`          | `jev-latest` (`typesafe/jev-1.14` on OpenRouter) | 1.14+ is required for `box` |
+| `DESIGNER_MODEL`     | `kimi-k3-high` (`moonshotai/kimi-k3` on OpenRouter) | needs image input |
+| `PLANNER_MODEL`      | `kimi-k3-low`               | faster replans                      |
+| `REPLICATE_API_TOKEN`| —                           | optional: designer renders new scene images |
 
 ## Experiments
 
@@ -71,9 +64,14 @@ The point is to find what works. Ideas, roughly from easiest to hardest:
 
 Log findings below as you go.
 
-| level | result | notes |
-| ----- | ------ | ----- |
-|       |        |       |
+| date | level | result | notes |
+| ---- | ----- | ------ | ----- |
+| 2026-11-12 | Buoy Run | ✅ complete, 26 decisions, ~45s | LingBot rendered the prompt-only red buoy (large, bright, one object). Jev steered to it, then drove onto the sand (done 0.95). Jev latency is 130–400ms per decision with 6 boxes + 4 checks. |
+| 2026-11-12 | Key to the Neon Door | ❌ stuck on stage 1 | LingBot never rendered the prompt-only brass key (small object), so stage 1 can't complete. Jev's `interact` was correctly refused (ready 0.38–0.46). Before `MIN_HOLD_MS` existed, Jev's 0.2s decisions made the officer jitter and spin. |
+| 2026-11-12 | Ring Run (4-agent version) | ✅ 5/5 rings in 72.7s, 60 player decisions | Prompt-only rings rendered, and LingBot grew them into a corridor of rings on stilts. Box steering + plan states worked (find → line up → punch through). The referee scored all 5 points; the first came early and may have been generous. Manual replan returned a revised graph in 7.2s. |
+| 2026-11-12 | Neon Canyon Run (generated from the theme "race a hovercar through glowing neon gates in a desert canyon at night") | ✅ 5/5 gates in 142.1s, 7s to spare | First fully generated world: scene 7s → image 22s → level 44s. LingBot rejected the raw 1376×768 PNG, so opening images are now normalised to a 1248-wide JPEG. The world drifted hard (red rock → purple dunes) but kept spawning gates. The planner auto-replanned twice, ending at Scan → Chase arch → Close in → Punch through. Jev latency rose to ~2.2–2.5s per decision (from 130–400ms earlier). An earlier attempt lost its Reactor session mid-run (cause unknown); agents now auto-pause on disconnect. |
+
+Lessons so far: LingBot needs an opening image, so generated worlds need an image model; normalise opening images to a ~1248-wide JPEG. objects that only exist in the prompt need to be **big and visually loud**, or be in the starting image. Hold each control for at least ~1.2s, because Jev decides much faster than LingBot shows motion.
 
 ## Caveats
 

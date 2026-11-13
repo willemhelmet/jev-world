@@ -4,8 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:op": "op run --no-masking --env-file=.env.op -- next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@reactor-models/lingbot-world-2": "^1.0.1",
@@ -14,6 +16,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "hls.js": "^1.6.0",
+    "mermaid": "^11.17.2",
     "next": "15.5.9",
     "radix-ui": "^1.4.3",
     "react": "19.2.3",

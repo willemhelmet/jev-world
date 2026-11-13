@@ -1,96 +1,127 @@
-import { readFile } from "node:fs/promises";
-import path from "node:path";
 import { NextResponse } from "next/server";
 import { validateLevel } from "@/lib/level";
-import { BUILTIN_LEVELS } from "@/lib/levels";
-import { ConfigError, DESIGNER_MODEL, chat } from "@/lib/server/openrouter";
+import { HttpError, NO_STORE, fail, failFrom, readJson } from "@/lib/server/http";
+import { generateScene, imageGenAvailable, toDataUrl } from "@/lib/server/images";
+import { design, designerModel } from "@/lib/server/providers";
+import { EXAMPLE_LEVEL, PLAN_RULES, RUBRIC_RULES, WORLD_RULES } from "@/lib/server/prompts";
 
 export const runtime = "nodejs";
-const headers = { "Cache-Control": "private, no-store" };
+export const maxDuration = 300;
 
-// The level designer agent. Given a starting image and a loose theme, it
-// writes a Level (see lib/level.ts): the world prompt for LingBot World 2,
-// the targets to track, and staged objectives with strict visual checks
-// that Jev will judge.
+// THE DESIGNER. LingBot World 2 needs an opening image, so the designer's
+// first job is to produce one. Two modes:
+//
+//   "scratch"  theme → (1) Kimi writes a scene → (2) image model renders the
+//              opening frame → (3) Kimi designs the level LOOKING AT that frame
+//   "edit"     existing image + theme → (1) Kimi designs the level and an edit
+//              instruction → (2) image model adds the level's objects to it
 
-const SYSTEM = `You design short game levels that are played inside LingBot World 2, a real-time image-to-video world model, by an AI player called Jev.
-
-How the world works:
-- LingBot starts from a single image and a text prompt and streams video. The player can move forward/back, strafe, and turn. There is NO game engine: objects exist only because the prompt and image describe them.
-- Interactions (pick up, open, ignite, ...) are implemented by temporarily adding an "event" clause to the prompt, then keeping an "after" clause describing the new world state. Whether it worked is judged visually by Jev.
-- Jev answers yes/no questions about frames, picks the next control, and draws bounding boxes around targets.
-
-Design rules:
-- Build on what is ACTUALLY in the image. You may add 1-2 new objects, described in prompt.base with "EXACTLY ONE ... at a fixed position" phrasing and vivid, distinctive visual features (color, glow, size) so the video model keeps them stable.
-- prompt.base must restate the subject, viewpoint, environment and style of the image. prompt.moving / prompt.still describe the subject's motion while controls are held / released, keeping the camera consistent.
-- 1-3 stages, ordered. Each stage has one target. Navigation stages ("reach X") have no interaction. Interaction stages have "ready" (target within reach right now) and an interaction.
-- "done" and "ready" are strict yes/no questions about the LAST image. Start with "In the LAST image, ...". Say what does NOT qualify (distant object, object merely visible, ambiguous view).
-- Targets: 2-4, including the player character/vehicle (label "player"). "describe" is a concrete visual description usable for a bounding box.
-- Keep it achievable within ~60 seconds of play. Favor visually dramatic outcomes (doors opening, lights turning on, fires, explosions of confetti) that make a good demo.
-
-Reply with ONLY a JSON object matching this TypeScript type:
-type Level = {
-  id: string; title: string; brief: string; viewpoint: string;
+const LEVEL_TYPE = `type Level = { id: string; title: string; brief: string; goal: string; imagePrompt: string; viewpoint: string;
   prompt: { base: string; moving: string; still: string };
   targets: { id: string; label: string; describe: string }[];
-  stages: { id: string; title: string; target: string; done: string;
-            ready?: string; interaction?: { label: string; event: string; after: string } }[];
-};
+  plan: { start: string; nodes: { id: string; label: string; when: string; mode: "search"|"steer"|"act"|"interact";
+    target?: string; actions?: string[]; interaction?: { label: string; event: string; after: string }; next: string[] }[] };
+  rubric: { events: { id: string; label: string; question: string; points: number; repeat: boolean; cooldownS?: number }[];
+    winPoints?: number; winEvent?: string; timeLimitS: number } };`;
 
-Here is an example level for a different image:
-${JSON.stringify({ ...BUILTIN_LEVELS[0], image: undefined, author: undefined })}`;
+const LEVEL_SYSTEM = `You design short game levels played inside LingBot World 2 (a real-time image-to-video world model) by an AI player called Jev, scored by an independent AI referee.
+${WORLD_RULES}
 
-async function loadImage(src: string): Promise<string> {
-  if (src.startsWith("data:image/")) {
-    if (src.length > 4_000_000) throw new Error("Image too large");
-    return src;
-  }
-  // Only images shipped in /public are readable.
-  const rel = path.normalize(src).replace(/^(\.\.(\/|\\|$))+/, "");
-  if (!/^\/?[\w\-/]+\.(jpe?g|png)$/i.test(rel)) throw new Error("Bad image path");
-  const file = path.join(process.cwd(), "public", rel);
-  const buf = await readFile(file);
-  const mime = /\.png$/i.test(file) ? "image/png" : "image/jpeg";
-  return `data:${mime};base64,${buf.toString("base64")}`;
-}
+Design rules:
+- Build on what is ACTUALLY in the image (subject, viewpoint, environment, style, and any challenge objects already present). In edit mode you may add 1-3 new objects; make them BIG, bright and distinctive.
+- "imagePrompt": in edit mode, an EDIT instruction that adds your new objects to the image ("add …, keep everything else exactly the same"). If the image already contains everything, repeat a short description of the scene.
+- prompt.base restates the subject, viewpoint, environment, style AND the challenge objects (with "EXACTLY ONE …" or exact counts). prompt.moving / prompt.still describe the subject's motion while controls are held / released, keeping the camera consistent.
+- "goal" is a short call to action shown on screen, e.g. "Drive through 5 rings" or "Escape the castle".
+- Targets: 2-4 including the player character/vehicle (label "player").
+- Favor visually dramatic, demo-worthy objectives achievable in under ~2 minutes.
+
+${PLAN_RULES}
+
+${RUBRIC_RULES}
+
+Reply with ONLY a JSON object of this TypeScript type:
+${LEVEL_TYPE}
+
+Example level for a different idea:
+${EXAMPLE_LEVEL}`;
+
+const SCENE_SYSTEM = `You are the world designer for a game played inside LingBot World 2, a real-time image-to-video world model. It needs ONE opening image; the whole world grows from it.
+${WORLD_RULES}
+
+Given a theme, invent a playable scene and write a prompt for a text-to-image model that renders its OPENING FRAME:
+- A cinematic 16:9 frame from a THIRD-PERSON video game: the camera is behind and slightly above ONE player character or vehicle, which is centred in the lower third and seen from behind. (Third person keeps the player visible, which helps the AI player and referee.)
+- The challenge objects must be IN the frame, big, bright and distinctive (e.g. glowing rings, a towering gate, a giant golden key), with room to move toward them.
+- Photorealistic or high-end game look, clear lighting, uncluttered composition, open traversable ground or water ahead. No text, no UI, no HUD, no watermark, no split panels.
+
+Reply with ONLY JSON: {"title": "<2-4 words>", "idea": "<one sentence: the challenge>", "imagePrompt": "<the text-to-image prompt, 60-120 words>"}`;
+
+const parseJson = (t: string) => JSON.parse(t.slice(t.indexOf("{"), t.lastIndexOf("}") + 1));
 
 export async function POST(request: Request) {
-  const origin = request.headers.get("origin");
-  if (origin && origin !== new URL(request.url).origin)
-    return NextResponse.json({ error: "Origin not allowed" }, { status: 403, headers });
+  let body: { mode?: "scratch" | "edit"; image?: string; theme?: string; generate?: boolean };
   try {
-    const { image, theme } = (await request.json()) as { image?: string; theme?: string };
-    if (typeof image !== "string") throw new Error("Supply an image");
-    const dataUrl = await loadImage(image);
-    const content = await chat([
-      { role: "system", content: SYSTEM },
-      {
-        role: "user",
-        content: [
-          { type: "image_url", image_url: { url: dataUrl } },
-          {
-            type: "text",
-            text: `Design a level for this starting image.${
-              theme?.trim() ? ` Theme / idea from the user: ${theme.trim().slice(0, 500)}` : " Pick the most fun, visually dramatic challenge the scene supports."
-            }`,
-          },
-        ],
-      },
-    ]);
-    const json = content.replace(/^```(?:json)?\s*|\s*```$/g, "");
-    const level = validateLevel({
-      ...JSON.parse(json),
-      id: `designed_${Date.now()}`,
-      image,
-      author: DESIGNER_MODEL,
-    });
-    return NextResponse.json({ level }, { headers });
+    body = await readJson(request, 9_000_000);
   } catch (e) {
-    const status = e instanceof ConfigError ? 503 : 502;
-    console.error(e);
-    return NextResponse.json(
-      { error: e instanceof Error ? e.message : "Design failed" },
-      { status, headers },
-    );
+    return fail(e instanceof Error ? e.message : "Invalid request", e instanceof HttpError ? e.status : 400);
+  }
+  const mode = body.mode === "edit" || (!body.mode && body.image) ? "edit" : "scratch";
+  const theme = (body.theme ?? "").trim().slice(0, 500);
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(280_000)]);
+  const timings: Record<string, number> = {};
+  const time = async <T,>(k: string, f: () => Promise<T>) => {
+    const t = performance.now();
+    try { return await f(); } finally { timings[k] = Math.round(performance.now() - t); }
+  };
+
+  try {
+    let opening: string; //       servable path of the opening image
+    let openingData: string; //   data URL Kimi looks at
+    let note = "";
+    let scene: { title?: string; idea?: string; imagePrompt?: string } = {};
+
+    if (mode === "scratch") {
+      if (!theme) return fail("Describe a theme for the new world.");
+      if (!imageGenAvailable())
+        return fail("LingBot needs an opening image: add REPLICATE_API_TOKEN to generate worlds from a theme, or start from an image.", 503);
+      scene = parseJson(await time("scene", () => design(SCENE_SYSTEM, null, `Theme: ${theme}`, signal)));
+      if (!scene.imagePrompt) throw new Error("World designer returned no image prompt");
+      opening = await time("image", () => generateScene(String(scene.imagePrompt), null, signal));
+      openingData = await toDataUrl(opening);
+    } else {
+      if (typeof body.image !== "string") return fail("Supply an image to start from.");
+      opening = body.image;
+      openingData = await toDataUrl(body.image);
+    }
+
+    const ask =
+      mode === "scratch"
+        ? `This is the generated OPENING FRAME of a new world. The intended challenge: ${scene.idea ?? theme}. Design the level around what is visible in this frame; do not add new objects. Reply with the JSON object only.`
+        : `Design a level for this starting image.${
+            theme ? ` Theme / idea from the user: ${theme}` : " Pick the most fun, visually dramatic challenge the scene supports."
+          } Reply with the JSON object only.`;
+    const raw = parseJson(await time("level", () => design(LEVEL_SYSTEM, openingData, ask, signal)));
+    const level = validateLevel({
+      ...raw,
+      title: raw.title ?? scene.title,
+      imagePrompt: mode === "scratch" ? scene.imagePrompt : raw.imagePrompt,
+      id: `designed_${Date.now()}`,
+      image: opening,
+      author: designerModel(),
+    });
+
+    // Edit mode: put the level's new objects into the image.
+    if (mode === "edit" && body.generate !== false) {
+      if (!imageGenAvailable()) note = "No REPLICATE_API_TOKEN, so the original image is used unedited.";
+      else if (level.imagePrompt) {
+        try {
+          level.image = await time("image", () => generateScene(level.imagePrompt!, openingData, signal));
+        } catch (e) {
+          note = `Image edit failed (${e instanceof Error ? e.message : e}); using the original image.`;
+        }
+      }
+    }
+    return NextResponse.json({ level, mode, timings, note }, { headers: NO_STORE });
+  } catch (e) {
+    return failFrom(e);
   }
 }
